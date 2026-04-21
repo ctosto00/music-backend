@@ -1,14 +1,10 @@
 """
 Backend music-proxy per Satin Echo.
-Risolve YouTube videoId → URL audio via yt-dlp e fa da relay HTTP.
-
-Endpoint:
-  GET  /                      usage hint
-  GET  /health                healthcheck
-  GET  /audio?videoId=<id>    streamma audio del video
 """
 
+import base64
 import os
+import tempfile
 import time
 
 import requests
@@ -17,32 +13,46 @@ from flask import Flask, Response, request
 
 app = Flask(__name__)
 
-# Cache in-memory videoId → stream URL con TTL.
-# Gli URL YouTube scadono dopo ~6h, un'ora di cache è conservativa.
 URL_CACHE: dict[str, dict] = {}
 CACHE_TTL_SEC = 60 * 60
 
-# User-Agent per il download del media da googlevideo.com.
-# Coerente con quello che yt-dlp usa di default per il WEB client.
 MEDIA_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
+def cookie_header_to_netscape(cookie_header: str) -> str:
+    lines = ["# Netscape HTTP Cookie File"]
+    for pair in cookie_header.split(";"):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        name, _, value = pair.partition("=")
+        name, value = name.strip(), value.strip()
+        lines.append(
+            f".youtube.com\tTRUE\t/\tTRUE\t9999999999\t{name}\t{value}"
+        )
+    return "\n".join(lines) + "\n"
 
-def get_stream_url(video_id: str) -> str | None:
+def get_stream_url(video_id, cookie_header):
     cached = URL_CACHE.get(video_id)
     if cached and cached["expires"] > time.time():
         return cached["url"]
 
     ydl_opts = {
-        # Preferenza: audio m4a (compatibile con expo-audio su Android),
-        # fallback al migliore audio disponibile
         "format": "bestaudio[ext=m4a]/bestaudio",
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
     }
+
+    cookie_path = None
+    if cookie_header:
+        netscape = cookie_header_to_netscape(cookie_header)
+        fd, cookie_path = tempfile.mkstemp(suffix=".txt", prefix="ytc_")
+        with os.fdopen(fd, "w") as f:
+            f.write(netscape)
+        ydl_opts["cookiefile"] = cookie_path
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -58,10 +68,15 @@ def get_stream_url(video_id: str) -> str | None:
                 "expires": time.time() + CACHE_TTL_SEC,
             }
             return url
-    except Exception as err:  # noqa: BLE001
+    except Exception as err:
         app.logger.error("yt-dlp error for %s: %s", video_id, err)
         return None
-
+    finally:
+        if cookie_path:
+            try:
+                os.unlink(cookie_path)
+            except OSError:
+                pass
 
 @app.get("/")
 def index():
@@ -71,11 +86,9 @@ def index():
         {"Content-Type": "text/plain"},
     )
 
-
 @app.get("/health")
 def health():
     return "ok", 200, {"Content-Type": "text/plain"}
-
 
 @app.get("/audio")
 def audio():
@@ -83,7 +96,15 @@ def audio():
     if not video_id:
         return "missing videoId param", 400
 
-    stream_url = get_stream_url(video_id)
+    cookie_header = None
+    cookie_b64 = request.headers.get("X-YT-Cookie-B64")
+    if cookie_b64:
+        try:
+            cookie_header = base64.b64decode(cookie_b64).decode("utf-8")
+        except Exception:
+            app.logger.warning("X-YT-Cookie-B64 non decodificabile")
+
+    stream_url = get_stream_url(video_id, cookie_header)
     if not stream_url:
         return "failed to resolve stream", 502
 
@@ -121,8 +142,3 @@ def audio():
         status=upstream.status_code,
         headers=response_headers,
     )
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
