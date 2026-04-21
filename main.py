@@ -40,7 +40,7 @@ def get_stream_url(video_id, cookie_header):
         return cached["url"]
 
     ydl_opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio",
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
