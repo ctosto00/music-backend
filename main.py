@@ -98,13 +98,29 @@ def audio():
 
     cookie_header = None
     cookie_b64 = request.headers.get("X-YT-Cookie-B64")
+    app.logger.error(
+        "DIAG: X-YT-Cookie-B64 header %s",
+        f"present ({len(cookie_b64)} chars b64)" if cookie_b64 else "MISSING",
+    )
     if cookie_b64:
         try:
             cookie_header = base64.b64decode(cookie_b64).decode("utf-8")
-        except Exception:
-            app.logger.warning("X-YT-Cookie-B64 non decodificabile")
+            names = [
+                p.split("=")[0].strip()
+                for p in cookie_header.split(";")
+                if "=" in p
+            ]
+            app.logger.error(
+                "DIAG: decoded cookie: %d chars, %d names, examples=%s",
+                len(cookie_header),
+                len(names),
+                ",".join(names[:5]),
+            )
+        except Exception as err:
+            app.logger.error("DIAG: decode failed: %s", err)
 
     stream_url = get_stream_url(video_id, cookie_header)
+
     if not stream_url:
         return "failed to resolve stream", 502
 
