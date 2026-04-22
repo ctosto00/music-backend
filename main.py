@@ -60,7 +60,12 @@ def get_stream_url(video_id, cookie_header):
         "no_warnings": True,
         "skip_download": True,
         "user_agent": CHROME_UA,
-        "extractor_args": {"youtube": {"player_client": ["web"]}},
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["tv_embedded", "web_embedded", "web"],
+                "formats": ["missing_pot"],
+            }
+        },
     }
 
     cookie_path = None
