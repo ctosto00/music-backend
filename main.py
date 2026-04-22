@@ -16,23 +16,38 @@ app = Flask(__name__)
 URL_CACHE: dict[str, dict] = {}
 CACHE_TTL_SEC = 60 * 60
 
-MEDIA_UA = (
+CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
+# Cookie YouTube che Google imposta come HttpOnly (solo via set-cookie HTTP).
+# yt-dlp usa Mozilla CookieJar che distingue: i cookie auth devono avere
+# il prefisso "#HttpOnly_" nel file Netscape, altrimenti non vengono
+# considerati auth-trusted.
+HTTP_ONLY_COOKIES = {
+    "SID", "HSID", "SSID", "APISID", "SAPISID",
+    "__Secure-1PSID", "__Secure-3PSID",
+    "__Secure-1PAPISID", "__Secure-3PAPISID",
+    "__Secure-1PSIDTS", "__Secure-3PSIDTS",
+    "__Secure-1PSIDCC", "__Secure-3PSIDCC",
+    "LOGIN_INFO",
+}
+
+
 def cookie_header_to_netscape(cookie_header: str) -> str:
-    lines = ["# Netscape HTTP Cookie File"]
+    lines = ["# Netscape HTTP Cookie File", ""]
     for pair in cookie_header.split(";"):
         pair = pair.strip()
         if not pair or "=" not in pair:
             continue
         name, _, value = pair.partition("=")
         name, value = name.strip(), value.strip()
-        lines.append(
-            f".youtube.com\tTRUE\t/\tTRUE\t9999999999\t{name}\t{value}"
-        )
+        prefix = "#HttpOnly_" if name in HTTP_ONLY_COOKIES else ""
+        domain = f"{prefix}.youtube.com"
+        lines.append(f"{domain}\tTRUE\t/\tTRUE\t9999999999\t{name}\t{value}")
     return "\n".join(lines) + "\n"
+
 
 def get_stream_url(video_id, cookie_header):
     cached = URL_CACHE.get(video_id)
@@ -44,6 +59,8 @@ def get_stream_url(video_id, cookie_header):
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "user_agent": CHROME_UA,
+        "extractor_args": {"youtube": {"player_client": ["web"]}},
     }
 
     cookie_path = None
@@ -53,6 +70,12 @@ def get_stream_url(video_id, cookie_header):
         with os.fdopen(fd, "w") as f:
             f.write(netscape)
         ydl_opts["cookiefile"] = cookie_path
+        # DIAG: log first lines of cookie file
+        app.logger.error(
+            "DIAG: cookie file %s, first line: %s",
+            cookie_path,
+            netscape.split("\n")[2][:80] if len(netscape.split("\n")) > 2 else "(empty)",
+        )
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -78,17 +101,17 @@ def get_stream_url(video_id, cookie_header):
             except OSError:
                 pass
 
+
 @app.get("/")
 def index():
-    return (
-        "music-backend\nUsage: /audio?videoId=<YOUTUBE_VIDEO_ID>\n",
-        200,
-        {"Content-Type": "text/plain"},
-    )
+    return ("music-backend\nUsage: /audio?videoId=<YT_ID>\n", 200,
+            {"Content-Type": "text/plain"})
+
 
 @app.get("/health")
 def health():
     return "ok", 200, {"Content-Type": "text/plain"}
+
 
 @app.get("/audio")
 def audio():
@@ -99,42 +122,28 @@ def audio():
     cookie_header = None
     cookie_b64 = request.headers.get("X-YT-Cookie-B64")
     app.logger.error(
-        "DIAG: X-YT-Cookie-B64 header %s",
-        f"present ({len(cookie_b64)} chars b64)" if cookie_b64 else "MISSING",
+        "DIAG: X-YT-Cookie-B64 %s",
+        f"present ({len(cookie_b64)}B)" if cookie_b64 else "MISSING",
     )
     if cookie_b64:
         try:
             cookie_header = base64.b64decode(cookie_b64).decode("utf-8")
-            names = [
-                p.split("=")[0].strip()
-                for p in cookie_header.split(";")
-                if "=" in p
-            ]
-            app.logger.error(
-                "DIAG: decoded cookie: %d chars, %d names, examples=%s",
-                len(cookie_header),
-                len(names),
-                ",".join(names[:5]),
-            )
+            app.logger.error("DIAG: decoded cookie: %d chars", len(cookie_header))
         except Exception as err:
             app.logger.error("DIAG: decode failed: %s", err)
 
     stream_url = get_stream_url(video_id, cookie_header)
-
     if not stream_url:
         return "failed to resolve stream", 502
 
     upstream_headers = {
-        "User-Agent": MEDIA_UA,
+        "User-Agent": CHROME_UA,
         "Range": request.headers.get("Range", "bytes=0-"),
     }
-
     try:
-        upstream = requests.get(
-            stream_url, headers=upstream_headers, stream=True, timeout=30
-        )
+        upstream = requests.get(stream_url, headers=upstream_headers,
+                                stream=True, timeout=30)
     except requests.RequestException as err:
-        app.logger.error("upstream fetch failed: %s", err)
         return f"upstream fetch failed: {err}", 502
 
     def generate():
@@ -153,8 +162,10 @@ def audio():
     if "Content-Length" in upstream.headers:
         response_headers["Content-Length"] = upstream.headers["Content-Length"]
 
-    return Response(
-        generate(),
-        status=upstream.status_code,
-        headers=response_headers,
-    )
+    return Response(generate(), status=upstream.status_code,
+                    headers=response_headers)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
